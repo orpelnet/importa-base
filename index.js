@@ -1,60 +1,69 @@
+
 const fs = require("fs");
 const path = require("path");
 const xlsx = require("xlsx");
 const mysql = require("mysql2/promise");
 
-function excelDateToMySQL(serial) {
-  if (!serial || isNaN(serial)) {
-    console.error("Número serial inválido:", serial);
-    return null;
-  }
-
+async function readExcelAndPersistToDB(filePath, tableName, dbConfig, chunkSize = 10000) {
   try {
-    const excelEpoch = new Date(1900, 0, 1);
-    const adjustedDate = new Date(
-      excelEpoch.getTime() + (serial - 1) * 86400000
-    );
-    const year = adjustedDate.getFullYear();
-    const month = String(adjustedDate.getMonth() + 1).padStart(2, "0");
-    const day = String(adjustedDate.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  } catch (error) {
-    console.error("Erro ao converter número serial para data:", error);
-    return null;
-  }
-}
-
-async function readExcelAndPersistToDB(filePath, tableName, dbConfig) {
-  try {
+    // Verifica se o arquivo existe
     if (!fs.existsSync(filePath)) {
       throw new Error(`O arquivo ${filePath} não foi encontrado.`);
     }
 
+    // Lê o arquivo Excel
     const workbook = xlsx.readFile(filePath);
-    const sheetName = workbook.SheetNames[0];
+    const sheetName = workbook.SheetNames[0]; // Seleciona a primeira aba
+    console.log("Aba selecionada:", sheetName);
+
     const worksheet = workbook.Sheets[sheetName];
 
-    const jsonData = xlsx.utils.sheet_to_json(worksheet);
+    // Converte a planilha para JSON
+    const jsonData = xlsx.utils.sheet_to_json(worksheet, { header: 1 }); // Inclui a primeira linha (cabeçalhos)
+    console.log(`Linhas totais na planilha: ${jsonData.length - 1}`);
 
-    const dataList = jsonData.map((row) => {
-      return [
-        row["contrato"],
-        row["cpf"],
-        row["origem"],
-        row["D8"],
-        excelDateToMySQL(row["venc"]),
-      ];
-    });
+    if (jsonData.length === 0) {
+      throw new Error("A planilha está vazia.");
+    }
 
+    // Primeira linha contém os cabeçalhos
+    const headers = jsonData[0].map((header) => header.replace(/\s+/g, "_").toLowerCase()); // Formata os cabeçalhos
+    const rows = jsonData.slice(1); // Demais linhas são os dados
+
+    // Conecta ao banco de dados
     const connection = await mysql.createConnection(dbConfig);
 
-    await connection.query("DELETE FROM tbconciliacaotodavida");
+    // Cria a tabela dinamicamente
+    console.log("Criando tabela no banco...");
+    const createTableQuery = `
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        ${headers.map((col) => `\`${col}\` TEXT`).join(",")}
+      );
+    `;
+    await connection.query(createTableQuery);
+    console.log(`Tabela "${tableName}" criada com sucesso.`);
 
-    const query = `INSERT INTO ${tableName} (contrato, cpf, origem, valorDesconto, dataCompetencia) VALUES ?`;
-    await connection.query(query, [dataList]);
+    // Remove dados antigos da tabela (se necessário)
+    console.log(`Limpando a tabela "${tableName}"...`);
+    await connection.query(`TRUNCATE TABLE ${tableName}`);
 
-    console.log(`Dados inseridos com sucesso na tabela ${tableName}.`);
+    // Insere os dados em chunks
+    console.log("Iniciando inserções em lote...");
+    for (let i = 0; i < rows.length; i += chunkSize) {
+      const chunk = rows.slice(i, i + chunkSize); // Pega um lote de dados
 
+      const placeholders = chunk
+        .map(() => `(${headers.map(() => "?").join(",")})`)
+        .join(",");
+      const flattenedData = chunk.flat();
+
+      const insertQuery = `INSERT INTO ${tableName} (${headers.join(",")}) VALUES ${placeholders}`;
+      await connection.query(insertQuery, flattenedData);
+
+      console.log(`Lote ${i / chunkSize + 1} inserido com sucesso.`);
+    }
+
+    console.log("Todos os dados foram inseridos com sucesso.");
     await connection.end();
   } catch (error) {
     console.error(`Erro ao processar o arquivo Excel: ${error.message}`);
@@ -68,8 +77,7 @@ const dbConfig = {
   database: "crm",
 };
 
-const filePath = path.join(__dirname, "Pasta11.xlsx");
-
-const tableName = "tbconciliacaotodavida";
+const filePath = path.join(__dirname, "Planteck.xlsx");
+const tableName = "tbconciliacaotodavidaTEMP";
 
 readExcelAndPersistToDB(filePath, tableName, dbConfig);
